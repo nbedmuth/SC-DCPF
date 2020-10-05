@@ -24,30 +24,33 @@ mpc["gen"][:,8] *= 1
 
 
 #CONSTANTS
-OUTER_RANGE = 30
-INNER_RANGE = 500
-LR_P = 1e-2
-LR_ALPHA = 1e0
-MOMENTUM = 0.9
+OUTER_RANGE = 100
+INNER_RANGE = 20
+LR_P = 1e-1
+LR_ALPHA = 1e-1
 SF = 5
-BF = 100
-USE_BREAKPOINTS = True
+BF = 10
+USE_BREAKPOINTS = False
+ALPHA_BREAKPOINTS = False
+
 #MAKES ADMITTANCE MATRIX
 def makeY(mpc):
 	baseMVA, br, bus = mpc["baseMVA"], mpc["branch"], mpc["bus"]
 	B_np = pf.makeB.makeB(baseMVA, bus, br, alg = 3)
 	B = torch.Tensor(np.array(B_np[0].toarray()))
 	Y,_,_ = pf.makeYbus.makeYbus(baseMVA, bus, br)
-	print(B)
-	print(Y)
-	if USE_BREAKPOINTS: ipdb.set_trace()
 	return Y, B
 
 
 #FUNCTION TO FIND WORKING AND OUT INDICES. REDUCED OUTAGE GENERATION.
 def P_modifier(P, gen, alpha_gen):
-	print("current P: {}".format(P))
-	print("alpha generators: {}".format(alpha_gen))
+
+	if USE_BREAKPOINTS: 
+		ipdb.set_trace()
+		print("current P: {}".format(P))
+		print("Pmax: {}".format(Pmax))
+		print("alpha generators: {}".format(alpha_gen))
+
 	out_indices = []
 	working_indices = []
 
@@ -58,13 +61,12 @@ def P_modifier(P, gen, alpha_gen):
 		else:
 			working_indices.append(index)
 
-	minimum = torch.min(P, ((Pmax) * (torch.ones(len(gen)) - alpha_gen))) #dPnew / dAlpha
+	minimum = torch.min(P, ((Pmax) * (torch.ones(len(gen)) - alpha_gen)))
 	Plost = torch.sum(P - minimum)
-	print("Plost: {}".format(Plost))
+
 	out_indices = torch.LongTensor(out_indices)
 	working_indices = torch.LongTensor(working_indices)
-	if USE_BREAKPOINTS: ipdb.set_trace()
-	print(working_indices, out_indices)
+
 	return minimum, Plost, out_indices, working_indices
 
 
@@ -89,7 +91,7 @@ class DCPFLayer(nn.Module):
 	def forward(self, Pnew):
 		mapping = {}
 		mapping = {**mapping, **dict(zip(self.gen[:,0], Pnew))}
-		if USE_BREAKPOINTS: ipdb.set_trace()
+		
 		non_slack_indices = []
 		Pnet = torch.zeros((len(self.bus)))
 		for index in range(len(self.bus)):
@@ -101,17 +103,21 @@ class DCPFLayer(nn.Module):
 				Pnet[index] = mapping[self.bus[index, 0]] - self.bus[index, 2]
 			else:
 				Pnet[index] = - self.bus[index, 2]
-		print("Pnet: {}".format(Pnet))
-		if USE_BREAKPOINTS: ipdb.set_trace()
+		if USE_BREAKPOINTS: 
+			ipdb.set_trace()
+			print("Pnet: {}".format(Pnet))
+		
 		non_slack_indices = torch.LongTensor(non_slack_indices)
 		B_reduced = self.B[:, non_slack_indices]
 		B_reduced = B_reduced[non_slack_indices,:]
 
 		theta = torch.zeros(len(self.bus))
 		theta[non_slack_indices] = torch.inverse(B_reduced) @ (Pnet[non_slack_indices])
-		print("theta : {}".format(theta))
-		if USE_BREAKPOINTS: ipdb.set_trace()
-		Pnet[slack_index] = self.B[slack_index,:]@theta
+		if USE_BREAKPOINTS: 
+			ipdb.set_trace()
+			print("theta : {}".format(theta))
+
+		Pnet[slack_index] = self.B[slack_index,:] @ theta
 		Pnew[slack_index] = Pnet[slack_index] + self.bus[slack_index, 2]
 		return theta, non_slack_indices, Pnew
 
@@ -121,115 +127,138 @@ class DCPFLayer(nn.Module):
 def GetFlows(theta, B, br, Lmax, alpha_lines):
 	outage_lines = []
 	L = torch.zeros(len(br))
-	L = [B[br[index,0], br[index,1]] * (theta[br[index,0]] - theta[br[index, 1]]) for index in range(len(br))]
+	L = [-B[br[index,0], br[index,1]] * (theta[br[index,0]] - theta[br[index, 1]]) for index in range(len(br))]
 	for index in range(len(br)):
-		if Lmax[index]*(1 - alpha_lines[index]) < L[index]:
+		if Lmax[index]*(1 - alpha_lines[index]) < torch.abs(L[index]):
 			outage_lines.append(index)
-	print("Line flow: {}".format(L))
-	print("Lmax: {}".format(Lmax))
-	print("alpha_lines: {}".format(alpha_lines))
-	if USE_BREAKPOINTS: ipdb.set_trace()
-	print("outage lines: {}".format(outage_lines))
-	if USE_BREAKPOINTS: ipdb.set_trace()
+
 	return(torch.Tensor(L)), outage_lines
 
 
-
-#CHECK COEFFICIENTS FROM GENCOST TO GET POWER GENERATION COST (REMAINING)
 def getLoss(L, Lmax, Pnew, Pmin, Pmax, alpha_gen, alpha_line, gencost):
+	#COSTS
 	highest_power = int(gencost[0,3] - 1)
 	costs = 0
 	for i in range(highest_power + 1):
-		costs += (torch.Tensor(gencost[:, 4+i]) @ (Pnew**(highest_power - i))).sum()	
-	print("Pmax: {}".format(Pmax))
-	print("alpha gen: {}".format(alpha_gen))
+		costs += (torch.Tensor(gencost[:, 4 + i]) * (Pnew**(highest_power - i))).sum()	
+	print("costs: {}".format(costs))
 
-	if USE_BREAKPOINTS: ipdb.set_trace()
-	print(1 - alpha_gen)
-	print(Pmax * (1 - alpha_gen))
 
-	if USE_BREAKPOINTS: ipdb.set_trace()
+	#LOSS
+	print("feasibility loss: {}".format((SF * torch.clamp((1/(Pmax - Pnew)) * alpha_gen, min = 0, max = 1000).sum()) + SF * (torch.clamp((1/(Lmax - torch.abs(L)) * alpha_line), min = 0, max = 1000)).sum()))
 	loss = costs + \
 	BF * torch.clamp(Pnew - Pmax * (1 - alpha_gen), min = 0).sum() + \
-	BF * torch.clamp(Pmin - Pnew, min = 0).sum()  - \
-	SF * torch.clamp(Pmax * (1 - alpha_gen) - Pnew, min = 0).sum() - \
-	SF * torch.clamp(Pnew - Pmin, min = 0).sum() + \
-	BF * (torch.clamp((torch.abs(L) - Lmax * (1 - alpha_line)), min = 0)).sum() - \
-	SF * (torch.clamp(Lmax * (1 - alpha_line) - torch.abs(L), min = 0)).sum()
+	BF * torch.clamp(Pmin - Pnew, min = 0).sum()  + \
+	SF * torch.clamp((1/(Pmax - Pnew)) * alpha_gen, min = 0, max = 1000).sum() + \
+	BF * (torch.clamp((torch.abs(L) - Lmax * (1 - alpha_line)), min = 0)).sum() + \
+	SF * (torch.clamp((1/(Lmax - torch.abs(L)) * alpha_line), min = 0, max = 1000)).sum()
+	print("total loss: {}".format(loss))
 
+	#INFEAS
 	infeas = BF * torch.clamp(Pnew - Pmax * (1 - alpha_gen), min = 0).sum() + \
 	BF * torch.clamp(Pmin - Pnew, min = 0).sum() + \
 	BF * (torch.clamp((torch.abs(L) - Lmax * (1 - alpha_line)), min = 0)).sum()
-
-	print("loss: {}".format(loss))
-	print("infeas loss: {}".format(infeas))
-	if USE_BREAKPOINTS: ipdb.set_trace()
-	#print("Pnew: {}".format(Pnew))
-	return loss/1e4, costs/1e4, infeas/1e4
+	print("infeas: {}".format(infeas))
+	#SF * torch.clamp(Pnew - Pmin, min = 0).sum() + \
+	#ipdb.set_trace()
+	return loss, costs, infeas
 
 def baseLoss(L, Lmax, Pnew, Pmin, Pmax, gencost):
 	highest_power = int(gencost[0,3] - 1)
 	costs = 0
 	for i in range(highest_power + 1):
-		costs += (torch.Tensor(gencost[:, 4+i]) @ (Pnew**(highest_power - i))).sum()	
+		costs += (torch.Tensor(gencost[:, 4 + i]) @ (Pnew**(highest_power - i))).sum()
+
+	ipdb.set_trace()
 
 	loss = costs + \
 	BF * torch.clamp(Pnew - Pmax, min = 0).sum() + \
-	BF * torch.clamp(Pmin - Pnew, min = 0).sum()  + \
 	BF * torch.clamp(torch.abs(L) - Lmax, min = 0).sum()
 
-	return loss/1e4
+	return loss
 
-def training_attack(alpha, alpha_opt, L, Lmax, Pnew, Pmin, Pmax,alpha_gen, alpha_lines, gencost):	
+def training_attack(epoch, alpha, alpha_opt, L, Lmax, Pnew, Pmin, Pmax,alpha_gen, alpha_lines, gencost):	
 	alpha_prev = alpha.detach()
 	alpha_opt.zero_grad()
 	loss, _,_ = getLoss(L, Lmax, Pnew, Pmin, Pmax,alpha_gen, alpha_lines, gencost)
 	(-loss).register_hook(lambda grad: print(grad))
-	(-loss).backward()
+	(-loss).backward(retain_graph =True)
+
 	
-	print("alpha before step: {}".format(alpha))
+	if ALPHA_BREAKPOINTS: 
+		ipdb.set_trace()
+		print("alpha before step: {}".format(alpha), "\n")
 	alpha_opt.step()
 
-	if USE_BREAKPOINTS: ipdb.set_trace()
-	print("alpha_grad: {}".format(alpha.grad.data))
-	print("alpha after step: {}".format(alpha))
-	if USE_BREAKPOINTS: ipdb.set_trace()
 
-	alpha.data.clamp_(0,1)
-	print("alpha after clamping: {}".format(alpha))
-	if USE_BREAKPOINTS: ipdb.set_trace()
+	if ALPHA_BREAKPOINTS: 
+		ipdb.set_trace()
+		print("alpha_grad: {}".format(alpha.grad.data), "\n")
+		print("alpha after step: {}".format(alpha), "\n")
+		#ipdb.set_trace()
+
+
+	#CVXPY
+	if (epoch + 1) % 10 == 0:
+		n = len(alpha)
+		x = cp.Variable(n)
+		objective_func = cp.Minimize(cp.norm((x - alpha.detach()), 2))
+		constraints = [0 <= x, sum(x) <= 1]
+		problem = cp.Problem(objective_func, constraints)
+		result = problem.solve()
+		alpha.data = torch.as_tensor(x.value).float()
+
+
+
+		if ALPHA_BREAKPOINTS: 
+			ipdb.set_trace()
+			print("alpha after clamping: {}".format(alpha), "\n")
 	return loss, alpha, alpha_prev
 
 
 
 def training_defense(P, Pnew, P_opt, L, Lmax, Pmin, Pmax,alpha_gen, alpha_lines, gencost) :
 	P_opt.zero_grad()
-	alpha_loss, costs, infeas = getLoss( L, Lmax, Pnew, Pmin, Pmax,alpha_gen, alpha_lines, gencost)
-	base_loss = baseLoss( L, Lmax, Pnew, Pmin, Pmax, gencost)
-	loss = alpha_loss + base_loss
-	loss.backward()
+	print("inside training defense:", "\n")
+	SF = 0
+	alpha_loss, costs, infeas = getLoss(L, Lmax, Pnew, Pmin, Pmax, alpha_gen, alpha_lines, gencost)
+	base_loss = baseLoss(L, Lmax, Pnew, Pmin, Pmax, gencost)
+	loss2 = alpha_loss + base_loss
+
+
+	print("defense loss before: alpha loss: {}, base_loss: {}".format(alpha_loss, base_loss))
+	(loss2).register_hook(lambda grad: print(grad))
+	loss2.backward()
+
+
+
+	print("P_grad: {}".format(P.grad.data), "\n")
+	print("P before: {}".format(P))
 	P_opt.step()
-	return loss, P, costs, infeas
+	print("P after: {}".format(P))
+	ipdb.set_trace()
+	return loss2, P, costs, infeas
 ###########################################################################################################################################################
 
 def main():
 
 	Y, B = makeY(mpc)	
-
 	#INITIALIZE CASEFILE DATA
 	bus = mpc["bus"]
 	gen = mpc["gen"]
 	br = torch.LongTensor(mpc["branch"])
 	gencost = mpc["gencost"]
-	#output = pf.rundcopf.rundcopf(mpc)
 
-	P = torch.Tensor(gen[:,1])
-	
+
+	output = pf.rundcopf.rundcopf(mpc)
+	P = torch.Tensor(output["gen"][:,1])
 	Pmax = torch.Tensor([gen[i,8] for i in range(len(gen))])
 	Pmin = torch.Tensor([gen[i,9] for i in range(len(gen))])
-	Lmax = torch.Tensor([br[i,6] for i in range(len(br))])
 	P.requires_grad = True
-	P_opt = optim.SGD([P], lr = LR_P, momentum = MOMENTUM)
+	P_opt = optim.SGD([P], lr = LR_P)
+
+
+	Lmax = torch.Tensor([br[i,6] for i in range(len(br))])
 
 
 	#INSTANTIATE THE DCPF SOLVER CLASS OBJECT
@@ -242,8 +271,10 @@ def main():
 	overall_list = []
 	plist = []
 	pnewlist = []
+
+#START OF LOOP		
+#############################################################################################################################################################
 	for outer_epoch in range(OUTER_RANGE):
-		print("Pset outer epoch beginning: {}".format(P))
 
 		#DEFINE ALPHA and NORMALIZE IT.
 		alpha = torch.rand(len(br) + len(gen))
@@ -252,82 +283,69 @@ def main():
 		alpha_opt = optim.SGD([alpha], lr = LR_ALPHA)
 		loss_list = []
 		print("alpha initiliazation : {}".format(alpha))
-		if USE_BREAKPOINTS: ipdb.set_trace()
 
-		for epoch in range(INNER_RANGE):
-			
-			print("Pmax: {}".format(Pmax))
-
-			#POST CONTINGENCY P
-			minimum, Plost, out_indices, working_indices = P_modifier(P, gen, alpha[len(br):])
-			
-			#GET PNEW AFTER PICKUPS
-			if USE_BREAKPOINTS: ipdb.set_trace()
-			Pnew = P_modifier2(Pmax, Plost, minimum, alpha[len(br):], out_indices, working_indices)
-			print("Pnew - P: {}".format(Pnew - P))
-			#FORWARD ON DCPF
-			theta, non_slack_indices, Pnew = DCPF(Pnew)
-
-			#FLOWS
-			L, outage_lines = GetFlows(theta, B, br, Lmax, alpha[:len(br)])
-			
-			#ATTACK LOSS
-			P_opt.zero_grad()
-			loss, alpha, alpha_prev = training_attack(alpha, alpha_opt, L, Lmax, Pnew, Pmin, Pmax,alpha[len(br):], alpha[:len(br)], gencost)
-
-			if (epoch + 1) % 50  == 0:
-				if alpha.sum() > 1: alpha.data = alpha.data/alpha.sum() 
-			
-			loss_list.append(loss.data.item())
-
-#END OF INNER LOOP		
+#START OF INNER LOOP	
 #############################################################################################################################################################
-		minimum, Plost, out_indices, working_indices = P_modifier(P, gen, alpha[len(br):])
+		for epoch in range(INNER_RANGE):
+		
+			minimum, Plost, out_indices, working_indices = P_modifier(P, gen, alpha[len(br):])	
+			Pnew = P_modifier2(Pmax, Plost, minimum, alpha[len(br):], out_indices, working_indices)
+			theta, non_slack_indices, Pnew = DCPF(Pnew)
+			L, outage_lines = GetFlows(theta, B, br, Lmax, alpha[:len(br)])
+			P_opt.zero_grad()
+			loss, alpha, alpha_prev = training_attack(epoch, alpha, alpha_opt, L, Lmax, Pnew, Pmin, Pmax,alpha[len(br):], alpha[:len(br)], gencost)
+
+
+#END OF INNER LOOP, FINAL ATTACK LOSS ADDED TO LOSS LIST		
+#############################################################################################################################################################
+		minimum, Plost, out_indices, working_indices = P_modifier(Pnew, gen, alpha[len(br):])
 		Pnew = P_modifier2(Pmax, Plost, minimum, alpha[len(br):], out_indices, working_indices)
 		theta, non_slack_indices, Pnew = DCPF(Pnew)
 		L,_ = GetFlows(theta, B, br, Lmax, alpha[:len(br)])
-		loss_list.append(getLoss(L, Lmax, Pnew, Pmin, Pmax,alpha[len(br):], alpha[:len(br)], gencost)[0].data.item())
-		overall_list.append(loss_list)
-		print("last alpha_loss: {}".format(loss_list[-1]))
+		#loss_list.append(getLoss(L, Lmax, Pnew, Pmin, Pmax,alpha[len(br):], alpha[:len(br)], gencost)[0].data.item())
+		#overall_list.append(loss_list)
 		print("Start of Outer Epoch: {}".format(outer_epoch + 1))
 
 #DEFENSE LOSS
+#############################################################################################################################################################
+		defense_loss, P, costs, infeas = training_defense(P, Pnew, P_opt, L, Lmax, Pmin, Pmax, alpha[len(br):], alpha[:len(br)], gencost)
+		# Should this P go as input to the next outr epoch ?
+		minimum, Plost, out_indices, working_indices = P_modifier(P, gen, alpha[len(br):])
+		Pnew = P_modifier2(Pmax, Plost, minimum, alpha[len(br):], out_indices, working_indices)
+		theta, non_slack_indices, Pdef = DCPF(Pnew)
+		L,outage_lines = GetFlows(theta, B, br, Lmax, alpha[:len(br)])
+		defense_loss, costs, _ = getLoss(L, Lmax, Pnew, Pmin, Pmax,alpha[len(br):], alpha[:len(br)], gencost)
+		#P = Pnew # required or not ? 
+
+		P_opt.zero_grad()
 		alpha_opt.zero_grad()
 
-		defense_loss, P, costs, infeas = training_defense(P, Pnew, P_opt, L, Lmax, Pmin, Pmax, alpha[len(br):], alpha[:len(br)], gencost)
-		plist.append(P[0])
-		pnewlist.append(Pnew[0])
 		defense_loss_list.append(defense_loss.data.item())
 		cost_list.append(costs.data.item())
 		infeas_list.append(infeas.data.item())
 
-		print(working_indices, out_indices)
+		#print(working_indices, out_indices)
+		print("outage lines after defense loss: {}".format(outage_lines))
 		print("defense loss: {}".format(defense_loss))
-		print("optimal P: {}".format(P))
-		print("Line Flow: {}".format(L))
-		print("alpha: {}".format(alpha))
+		print("alpha after end of outer EPOCH: {}".format(alpha))
 
 	#PLOTS
-	fig, axs = plt.subplots(5)
-	fig.suptitle("Maximization loss vs EPOCH")
-	for i in range(5):
-		axs[i].plot(range(1, len(overall_list[2*i]) + 1), overall_list[2*i])
-	plt.show()
+	#fig, axs = plt.subplots(5)
+	#fig.suptitle("Maximization loss vs EPOCH")
+	#for i in range(5):
+	#	axs[i].plot(range(1, len(overall_list[2*i]) + 1), overall_list[2*i])
+	#plt.show()
 
 	#TOTAL OBJECTIVE FUNCTION & COSTS
-	plt.plot(range(1,OUTER_RANGE + 1),defense_loss_list, "r--", range(1,OUTER_RANGE + 1), cost_list, "g^")
+	plt.plot(range(1,OUTER_RANGE + 1),defense_loss_list, "r--")
+	plt.show()
+
+	plt.plot(range(1,OUTER_RANGE + 1), cost_list, "g^")
 	plt.show()
 
 	#INFEASIBILITY COSTS
 	plt.plot(range(1,OUTER_RANGE + 1), infeas_list)
 	plt.show()
 
-	#OPTIMIZED POWER
-	#plt.plot(range(1,len(plist) + 1), plist)
-	#plt.show()
-
-
-	#plt.plot(range(1,len(pnewlist) + 1), pnewlist)
-	#plt.show()
 
 main()
