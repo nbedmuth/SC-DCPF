@@ -3,6 +3,8 @@ import torch.nn as nn
 from torch import Tensor
 import numpy as np
 
+from pypower import idx_bus #, idx_gen
+
 import ipdb
 
 USE_BREAKPOINTS = False
@@ -17,47 +19,22 @@ class DCPFLayer(nn.Module):
         self.br  = br
         self.mpc = mpc
 
-    def forward(self, Pnew):
-        non_slack_indices = torch.LongTensor(np.where(self.bus[:, 1] != 3)[0])
-        slack_index = np.where(self.bus[:, 1] == 3)[0][0]
-        slack_gen_indices = np.where(self.bus[:, 1] != 1)[0]
+        self.non_slack_idxes = torch.LongTensor(np.where(self.bus[:, idx_bus.BUS_TYPE] != 3)[0])
+        self.slack_idx = np.where(self.bus[:, idx_bus.BUS_TYPE] == 3)[0][0]
+        self.slack_gen_idxes = np.where(self.bus[:, idx_bus.BUS_TYPE] != 1)[0]
+        self.B_reduced = self.B[self.non_slack_idxes[:, None], self.non_slack_idxes]
 
-        Pnet = -torch.Tensor(self.bus[:, 2])
-        Pnet[slack_gen_indices] += Pnew
-
-        # mapping = {}
-        # mapping = {**mapping, **dict(zip(self.gen[:,0], Pnew))}
-        
-        # non_slack_indices = []
-        # Pnet = torch.zeros((len(self.bus)))
-        # for index in range(len(self.bus)):
-        #     if self.bus[index, 1] != 3:
-        #         non_slack_indices.append(index)
-        #     else:
-        #         slack_index = index
-        #     if self.bus[index, 0] in mapping:
-        #         Pnet[index] = mapping[self.bus[index, 0]] - self.bus[index, 2]
-        #     else:
-        #         Pnet[index] = - self.bus[index, 2]
-        # if USE_BREAKPOINTS: 
-        #     ipdb.set_trace()
-        #     print("Pnet: {}".format(Pnet))
-        
-        # non_slack_indices = torch.LongTensor(non_slack_indices)
-
-        B_reduced = self.B[:, non_slack_indices]
-        B_reduced = B_reduced[non_slack_indices,:]
+    def forward(self, Pg):
+        Pnet = -torch.Tensor(self.bus[:, idx_bus.PD])
+        Pnet[self.slack_gen_idxes] += Pg
 
         theta = torch.zeros(len(self.bus))
-        theta[non_slack_indices] = torch.inverse(B_reduced) @ (Pnet[non_slack_indices])
-        if USE_BREAKPOINTS: 
-            ipdb.set_trace()
-            print("theta : {}".format(theta))
+        theta[self.non_slack_idxes] = torch.inverse(self.B_reduced) @ (Pnet[self.non_slack_idxes])
+        # print("theta : {}".format(theta))
 
-        Pnet[slack_index] = self.B[slack_index,:] @ theta
+        Pnet[self.slack_idx] = self.B[self.slack_idx, :] @ theta 
 
-        Pslack = Pnet[slack_index] + self.bus[slack_index, 2]
-        Pnew_postflow = torch.cat([Pslack.unsqueeze(0), Pnew[1:]])
-        # ipdb.set_trace()
-        # Pnew[slack_index] = Pnet[slack_index] + self.bus[slack_index, 2]
-        return theta, non_slack_indices, Pnew_postflow
+        Pg_slack = Pnet[self.slack_idx] + self.bus[self.slack_idx, idx_bus.PD]
+        Pg_postflow = torch.cat([Pg_slack.unsqueeze(0), Pg[1:]])
+
+        return theta, Pg_postflow
